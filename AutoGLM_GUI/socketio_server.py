@@ -30,11 +30,53 @@ sio = socketio.AsyncServer(
     server_kwargs={"socketio_path": "/socket.io"},
 )
 
+MAX_CONCURRENT_STREAMS = 5
+STREAM_START_DELAY = 1.5
+STREAM_KEEPALIVE_SECONDS = 30
+
+_stream_start_semaphore: asyncio.Semaphore | None = None
+_stream_wait_queue: asyncio.Queue[tuple[str, dict[str, Any]]] | None = None
+_stream_cleanup_task: asyncio.Task[None] | None = None
+
 _socket_streamers: dict[str, ScrcpyStreamer] = {}
 _stream_tasks: dict[str, asyncio.Task[None]] = {}
-_device_locks: dict[
-    str, asyncio.Lock
-] = {}  # Lock per device to prevent concurrent connections
+_device_locks: dict[str, asyncio.Lock] = {}
+_device_keepalive: dict[str, float] = {}
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _stream_start_semaphore
+    if _stream_start_semaphore is None:
+        _stream_start_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+    return _stream_start_semaphore
+
+
+def _get_wait_queue() -> asyncio.Queue[tuple[str, dict[str, Any]]]:
+    global _stream_wait_queue
+    if _stream_wait_queue is None:
+        _stream_wait_queue = asyncio.Queue()
+    return _stream_wait_queue
+
+
+def _ensure_cleanup_task() -> None:
+    global _stream_cleanup_task
+    existing_task = _stream_cleanup_task
+    if existing_task is None or existing_task.done():
+        new_task = asyncio.create_task(_cleanup_stale_streams())
+        _stream_cleanup_task = new_task
+
+
+async def _cleanup_stale_streams() -> None:
+    while True:
+        await asyncio.sleep(10)
+        now = time.time()
+        stale_devices = [d for d, t in _device_keepalive.items() if t < now]
+        for device_id in stale_devices:
+            logger.info(
+                f"Cleaning up stale stream for device {device_id} (keepalive expired)"
+            )
+            stop_streamers(device_id=device_id)
+            _device_keepalive.pop(device_id, None)
 
 
 async def _stop_stream_for_sid(sid: str) -> None:
@@ -44,6 +86,8 @@ async def _stop_stream_for_sid(sid: str) -> None:
 
     streamer = _socket_streamers.pop(sid, None)
     if streamer:
+        if streamer.device_id:
+            _device_keepalive.pop(streamer.device_id, None)
         streamer.stop()
 
 
@@ -142,11 +186,19 @@ async def connect(sid: str, environ: dict[str, Any]) -> None:
 @sio.event
 async def disconnect(sid: str) -> None:
     logger.info("Socket.IO client disconnected: %s", sid)
+    global _stream_cleanup_task
+    if _stream_cleanup_task is None or _stream_cleanup_task.done():
+        _stream_cleanup_task = asyncio.create_task(_cleanup_stale_streams())
     await _stop_stream_for_sid(sid)
+    await _process_wait_queue()
 
 
-@sio.on("connect-device")  # type: ignore[misc]
+@sio.on("connect-device")
 async def connect_device(sid: str, data: dict[str, Any] | None) -> None:
+    global _stream_cleanup_task
+    if _stream_cleanup_task is None or _stream_cleanup_task.done():
+        _stream_cleanup_task = asyncio.create_task(_cleanup_stale_streams())
+
     payload = data or {}
     device_id = payload.get("device_id") or payload.get("deviceId")
     if not device_id:
@@ -160,20 +212,38 @@ async def connect_device(sid: str, data: dict[str, Any] | None) -> None:
     max_size = int(payload.get("maxSize") or 1280)
     bit_rate = int(payload.get("bitRate") or 4_000_000)
 
-    # Stop any existing stream for this sid
     await _stop_stream_for_sid(sid)
 
-    # Get or create a lock for this device
     if device_id not in _device_locks:
         _device_locks[device_id] = asyncio.Lock()
 
     device_lock = _device_locks[device_id]
 
-    # Acquire lock to prevent concurrent connections to the same device
+    semaphore = _get_semaphore()
+
+    if semaphore.locked():
+        stream_wait_queue = _get_wait_queue()
+        queue_position = stream_wait_queue.qsize() + 1
+        await stream_wait_queue.put((sid, payload))
+        await sio.emit(
+            "stream-queued",
+            {
+                "message": f"Too many streams starting. Your request is queued (position: {queue_position}).",
+                "queue_position": queue_position,
+                "max_concurrent": MAX_CONCURRENT_STREAMS,
+            },
+            to=sid,
+        )
+        logger.info(
+            f"Stream request queued for {device_id} (sid: {sid}), queue position: {queue_position}"
+        )
+        return
+
+    await semaphore.acquire()
+
     async with device_lock:
         logger.debug(f"Acquired device lock for {device_id}, sid: {sid}")
 
-        # Stop any existing streams for the same device (from other sids)
         sids_to_stop = [
             s
             for s, streamer in _socket_streamers.items()
@@ -190,7 +260,7 @@ async def connect_device(sid: str, data: dict[str, Any] | None) -> None:
         )
 
         try:
-            await streamer.start()  # ScrcpyStreamer has built-in retry logic
+            await streamer.start()
             metadata = await streamer.read_video_metadata()
             await sio.emit(
                 "video-metadata",
@@ -205,10 +275,93 @@ async def connect_device(sid: str, data: dict[str, Any] | None) -> None:
 
             _socket_streamers[sid] = streamer
             _stream_tasks[sid] = asyncio.create_task(_stream_packets(sid, streamer))
+            _device_keepalive[device_id] = time.time() + STREAM_KEEPALIVE_SECONDS
 
         except Exception as exc:
             streamer.stop()
             logger.exception("Failed to start scrcpy stream: %s", exc)
-            # Use unified error classification
             error_info = _classify_error(exc)
             await sio.emit("error", error_info, to=sid)
+        finally:
+            semaphore.release()
+            await _process_wait_queue()
+
+
+async def _process_wait_queue() -> None:
+    stream_wait_queue = _get_wait_queue()
+    if stream_wait_queue.empty():
+        return
+
+    await asyncio.sleep(STREAM_START_DELAY)
+
+    if stream_wait_queue.empty():
+        return
+
+    next_sid, next_payload = await stream_wait_queue.get()
+    next_device_id = next_payload.get("device_id") or next_payload.get("deviceId")
+
+    if not next_device_id:
+        logger.warning(f"Cannot process queued stream: missing device_id")
+        return
+
+    semaphore = _get_semaphore()
+    if semaphore.locked():
+        await stream_wait_queue.put((next_sid, next_payload))
+        return
+
+    await semaphore.acquire()
+
+    asyncio.create_task(
+        _start_queued_stream(next_sid, next_device_id, next_payload, semaphore)
+    )
+
+
+async def _start_queued_stream(
+    sid: str, device_id: str, payload: dict[str, Any], semaphore: asyncio.Semaphore
+) -> None:
+    max_size = int(payload.get("maxSize") or 1280)
+    bit_rate = int(payload.get("bitRate") or 4_000_000)
+
+    if device_id not in _device_locks:
+        _device_locks[device_id] = asyncio.Lock()
+
+    device_lock = _device_locks[device_id]
+
+    async with device_lock:
+        await _stop_stream_for_sid(sid)
+
+        logger.info(f"Starting queued stream for device {device_id}, sid: {sid}")
+
+        streamer = ScrcpyStreamer(
+            device_id=device_id,
+            max_size=max_size,
+            bit_rate=bit_rate,
+        )
+
+        try:
+            await streamer.start()
+            metadata = await streamer.read_video_metadata()
+            await sio.emit(
+                "stream-ready",
+                {
+                    "deviceName": metadata.device_name,
+                    "width": metadata.width,
+                    "height": metadata.height,
+                    "codec": metadata.codec,
+                    "message": "Your queued stream is now ready",
+                },
+                to=sid,
+            )
+
+            _socket_streamers[sid] = streamer
+            _stream_tasks[sid] = asyncio.create_task(_stream_packets(sid, streamer))
+            _device_keepalive[device_id] = time.time() + STREAM_KEEPALIVE_SECONDS
+
+        except Exception as exc:
+            streamer.stop()
+            logger.exception("Failed to start queued scrcpy stream: %s", exc)
+            error_info = _classify_error(exc)
+            await sio.emit("error", error_info, to=sid)
+        finally:
+            semaphore.release()
+            await _process_wait_queue()

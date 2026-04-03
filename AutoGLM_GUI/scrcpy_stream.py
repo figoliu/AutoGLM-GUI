@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,64 @@ from AutoGLM_GUI.scrcpy_protocol import (
     ScrcpyVideoStreamMetadata,
     ScrcpyVideoStreamOptions,
 )
+
+
+class ScrcpyPortPool:
+    """Global port pool to avoid port conflicts when multiple devices stream simultaneously.
+
+    Uses a shared queue of ports. Each ScrcpyStreamer acquires a port from the pool
+    when starting and releases it back when stopping.
+    """
+
+    _instance: "ScrcpyPortPool | None" = None
+    _instance_lock = threading.Lock()
+
+    BASE_PORT = 27183
+    MAX_PORTS = 50
+
+    def __init__(self):
+        self._available_ports: asyncio.Queue[int] = asyncio.Queue()
+        self._used_ports: set[int] = set()
+        self._device_port_map: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+        for port in range(self.BASE_PORT, self.BASE_PORT + self.MAX_PORTS):
+            self._available_ports.put_nowait(port)
+
+    @classmethod
+    def get_instance(cls) -> "ScrcpyPortPool":
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    async def acquire_port(self, device_id: str) -> int:
+        port = await self._available_ports.get()
+        with self._lock:
+            self._used_ports.add(port)
+            self._device_port_map[device_id] = port
+        logger.info(f"Port pool: acquired port {port} for device {device_id}")
+        return port
+
+    async def release_port(self, device_id: str) -> None:
+        port = None
+        with self._lock:
+            port = self._device_port_map.pop(device_id, None)
+            if port and port in self._used_ports:
+                self._used_ports.remove(port)
+                await self._available_ports.put(port)
+
+        if port:
+            logger.info(f"Port pool: released port {port} from device {device_id}")
+
+    def get_port_for_device(self, device_id: str) -> int | None:
+        with self._lock:
+            return self._device_port_map.get(device_id)
+
+    def get_used_port_count(self) -> int:
+        with self._lock:
+            return len(self._used_ports)
 
 
 async def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
@@ -118,7 +177,7 @@ class ScrcpyStreamer:
         device_id: str | None = None,
         max_size: int = 1280,
         bit_rate: int = 1_000_000,
-        port: int = 27183,
+        port: int | None = None,
         idr_interval_s: int = 1,
         stream_options: ScrcpyVideoStreamOptions | None = None,
     ):
@@ -128,26 +187,27 @@ class ScrcpyStreamer:
             device_id: ADB device serial (None for default device)
             max_size: Maximum video dimension
             bit_rate: Video bitrate in bps
-            port: TCP port for scrcpy socket
+            port: TCP port for scrcpy socket. If None, port is auto-allocated from global pool.
             idr_interval_s: Seconds between IDR frames (controls GOP length)
             stream_options: Scrcpy protocol options for metadata/frame parsing
         """
         self.device_id = device_id
         self.max_size = max_size
         self.bit_rate = bit_rate
-        self.port = port
+        self._requested_port = port
+        self.port = port if port is not None else 27183
         self.idr_interval_s = idr_interval_s
         self.stream_options = stream_options or ScrcpyVideoStreamOptions()
 
         self.scrcpy_process: subprocess.Popen[bytes] | AsyncProcess | None = None
         self.tcp_socket: socket.socket | None = None
         self.forward_cleanup_needed = False
+        self._port_from_pool = False
 
         self._read_buffer = bytearray()
         self._metadata: ScrcpyVideoStreamMetadata | None = None
         self._dummy_byte_skipped = False
 
-        # Find scrcpy-server location
         self.scrcpy_server_path = self._find_scrcpy_server()
 
     def _find_scrcpy_server(self) -> str:
@@ -201,6 +261,11 @@ class ScrcpyStreamer:
         logger.debug("Reset stream state")
 
         try:
+            if self._requested_port is None:
+                port_pool = ScrcpyPortPool.get_instance()
+                self.port = await port_pool.acquire_port(self.device_id or "default")
+                self._port_from_pool = True
+
             # 0. Check device availability first
             logger.info(f"Checking device {self.device_id} availability...")
             await check_device_available(self.device_id)
@@ -586,6 +651,22 @@ class ScrcpyStreamer:
                     exc,
                 )
             self.forward_cleanup_needed = False
+
+        if self._port_from_pool and self.port:
+            port_to_release = self.port
+            device_id_for_release = self.device_id or "default"
+            asyncio.create_task(
+                self._release_port_async(device_id_for_release, port_to_release)
+            )
+            self._port_from_pool = False
+
+    async def _release_port_async(self, device_id: str, port: int) -> None:
+        """Async helper to release port back to pool."""
+        try:
+            port_pool = ScrcpyPortPool.get_instance()
+            await port_pool.release_port(device_id)
+        except Exception as e:
+            logger.debug(f"Failed to release port {port} to pool: {e}")
 
     def __del__(self):
         self.stop()

@@ -41,6 +41,20 @@ interface VideoMetadata {
   codec?: number;
 }
 
+interface StreamQueuedPayload {
+  message?: string;
+  queue_position?: number;
+  max_concurrent?: number;
+}
+
+interface StreamReadyPayload {
+  deviceName?: string;
+  width?: number;
+  height?: number;
+  codec?: number;
+  message?: string;
+}
+
 interface VideoPacket {
   type: 'configuration' | 'data';
   data: ArrayBuffer | Uint8Array;
@@ -76,9 +90,10 @@ export function ScrcpyPlayer({
   const isVisibleRef = useRef(isVisible); // ✅ 新增：用 ref 追踪 isVisible
 
   const [status, setStatus] = useState<
-    'connecting' | 'connected' | 'error' | 'disconnected'
+    'connecting' | 'queued' | 'connected' | 'error' | 'disconnected'
   >('connecting');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const [screenInfo, setScreenInfo] = useState<{
     width: number;
     height: number;
@@ -365,7 +380,7 @@ export function ScrcpyPlayer({
     socket.on('connect', () => {
       console.log(
         `[ScrcpyPlayer] [${deviceId}] Socket connected, emitting connect-device`
-      ); // ✅ 方案 3
+      );
       socket.emit('connect-device', {
         device_id: deviceId,
         maxSize: 1280,
@@ -381,6 +396,57 @@ export function ScrcpyPlayer({
           onFallbackRef.current?.();
         }
       }, fallbackTimeoutRef.current);
+    });
+
+    socket.on('stream-queued', (payload: StreamQueuedPayload) => {
+      console.log(`[ScrcpyPlayer] [${deviceId}] Stream queued:`, payload);
+      setStatus('queued');
+      setQueuePosition(payload.queue_position ?? null);
+      setErrorMessage(
+        payload.message ?? `Stream queued (position: ${payload.queue_position})`
+      );
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
+        fallbackTimerRef.current = null;
+      }
+    });
+
+    socket.on('stream-ready', async (metadata: StreamReadyPayload) => {
+      console.log(`[ScrcpyPlayer] [${deviceId}] Stream ready:`, metadata);
+      try {
+        if (decoderRef.current) {
+          decoderRef.current.dispose();
+          decoderRef.current = null;
+        }
+
+        const codecId = metadata.codec
+          ? (metadata.codec as ScrcpyVideoCodecId)
+          : ScrcpyVideoCodecId.H264;
+
+        decoderRef.current = await createDecoder(codecId);
+        decoderRef.current.sizeChanged(({ width, height }) => {
+          setScreenInfo({ width, height });
+        });
+
+        const videoStream = setupVideoStream(metadata);
+        videoStream
+          .pipeTo(decoderRef.current.writable as WritableStream<VideoPacket>)
+          .catch((error: Error) => {
+            console.error('[ScrcpyPlayer] Video stream error:', error);
+          });
+
+        setStatus('connected');
+        setQueuePosition(null);
+        onStreamReadyRef.current?.({ close: () => socket.close() });
+      } catch (error) {
+        console.error('[ScrcpyPlayer] Decoder initialization failed:', error);
+        setStatus('error');
+        setErrorMessage('Decoder initialization failed');
+        suppressReconnectRef.current = true;
+        socket.close();
+        const reason = detectWebCodecsUnavailabilityReason() || 'decoder_error';
+        onFallbackRef.current?.(reason);
+      }
     });
 
     socket.on('video-metadata', async (metadata: VideoMetadata) => {
