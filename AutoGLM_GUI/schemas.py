@@ -638,6 +638,22 @@ class RemoteDeviceDiscoverResponse(BaseModel):
     error: str | None = None
 
 
+class NetworkDiscoverRequest(BaseModel):
+    """局域网设备发现请求."""
+
+    subnet: str | None = None
+    timeout: float = 0.5
+
+
+class NetworkDiscoverResponse(BaseModel):
+    """局域网设备发现响应."""
+
+    success: bool
+    devices: list[str]
+    message: str
+    error: str | None = None
+
+
 class RemoteDeviceAddRequest(BaseModel):
     """添加远程设备请求."""
 

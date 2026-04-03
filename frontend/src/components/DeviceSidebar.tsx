@@ -12,6 +12,7 @@ import {
   CheckCircle,
   XCircle,
   FolderCog,
+  RefreshCw,
 } from 'lucide-react';
 import { GroupedDeviceList } from './GroupedDeviceList';
 import { Button } from '@/components/ui/button';
@@ -34,6 +35,7 @@ import {
   cancelQRPairing,
   connectWifiManual,
   discoverMdnsDevices,
+  discoverNetworkDevices,
   discoverRemoteDevices,
   generateQRPairing,
   getQRPairingStatus,
@@ -147,6 +149,14 @@ export function DeviceSidebar({
   const [discoveredDevices, setDiscoveredDevices] = useState<MdnsDevice[]>([]);
   const [isScanning, setIsScanning] = useDebouncedState(false, 300);
   const [scanError, setScanError] = useState('');
+
+  // Network device discovery
+  const [discoveredNetworkDevices, setDiscoveredNetworkDevices] = useState<
+    string[]
+  >([]);
+  const [isNetworkScanning, setIsNetworkScanning] = useState(false);
+  const [networkScanError, setNetworkScanError] = useState('');
+  const [selectedIps, setSelectedIps] = useState<Set<string>>(new Set());
 
   // QR pairing state
   interface QRPairingSession {
@@ -575,6 +585,65 @@ export function DeviceSidebar({
     }
   }, [t.deviceSidebar.scanError, setIsScanning]);
 
+  // Network device discovery handler
+  const handleDiscoverNetwork = useCallback(async () => {
+    setIsNetworkScanning(true);
+    setNetworkScanError('');
+    setSelectedIps(new Set());
+
+    try {
+      const result = await discoverNetworkDevices();
+
+      if (result.success) {
+        setDiscoveredNetworkDevices(result.devices);
+      } else {
+        setNetworkScanError(result.error || 'Scan failed');
+        setDiscoveredNetworkDevices([]);
+      }
+    } catch (error) {
+      setNetworkScanError(String(error));
+      setDiscoveredNetworkDevices([]);
+    } finally {
+      setIsNetworkScanning(false);
+    }
+  }, [setIsNetworkScanning]);
+
+  // Batch connect selected devices
+  const handleConnectSelected = async () => {
+    if (selectedIps.size === 0) return;
+    setIsConnecting(true);
+    try {
+      for (const ip of Array.from(selectedIps)) {
+        await connectWifiManual({ ip, port: 5555 });
+      }
+      setShowManualConnect(false);
+    } catch (error) {
+      setNetworkScanError(String(error));
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  // Toggle IP selection
+  const toggleIpSelection = (ip: string) => {
+    const newSet = new Set(selectedIps);
+    if (newSet.has(ip)) {
+      newSet.delete(ip);
+    } else {
+      newSet.add(ip);
+    }
+    setSelectedIps(newSet);
+  };
+
+  // Toggle select all
+  const toggleSelectAll = () => {
+    if (selectedIps.size === discoveredNetworkDevices.length) {
+      setSelectedIps(new Set());
+    } else {
+      setSelectedIps(new Set(discoveredNetworkDevices));
+    }
+  };
+
   // Handle clicking on a discovered device
   const handleDeviceClick = async (
     device: MdnsDevice,
@@ -776,7 +845,7 @@ export function DeviceSidebar({
               onValueChange={setActiveTab}
               className="w-full"
             >
-              <TabsList className="grid w-full grid-cols-3">
+              <TabsList className="grid w-full grid-cols-4">
                 <TabsTrigger value="direct">
                   {t.deviceSidebar.directConnectTab}
                 </TabsTrigger>
@@ -786,6 +855,7 @@ export function DeviceSidebar({
                 <TabsTrigger value="remote">
                   {t.deviceSidebar.remoteTab || '远程设备'}
                 </TabsTrigger>
+                <TabsTrigger value="network">{'网段扫描'}</TabsTrigger>
               </TabsList>
 
               {/* Direct Connect Tab */}
@@ -1367,6 +1437,116 @@ export function DeviceSidebar({
                   </Button>
                 )}
               </TabsContent>
+
+              {/* Network Scan Tab */}
+              <TabsContent value="network" className="space-y-4 mt-4">
+                {/* Header with select all and batch connect */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={
+                        discoveredNetworkDevices.length > 0 &&
+                        selectedIps.size === discoveredNetworkDevices.length
+                      }
+                      onChange={toggleSelectAll}
+                      className="h-4 w-4 rounded border-slate-300"
+                      disabled={discoveredNetworkDevices.length === 0}
+                    />
+                    <h3 className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                      {selectedIps.size > 0
+                        ? `已选择 ${selectedIps.size}/${discoveredNetworkDevices.length}`
+                        : '局域网设备'}
+                    </h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleDiscoverNetwork}
+                      disabled={isNetworkScanning}
+                      className="h-8"
+                    >
+                      {isNetworkScanning ? (
+                        <>
+                          <span className="mr-2 h-3 w-3 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+                          {'扫描中...'}
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="mr-2 h-3 w-3" />
+                          {'重新扫描'}
+                        </>
+                      )}
+                    </Button>
+                    {selectedIps.size > 0 && (
+                      <Button
+                        size="sm"
+                        onClick={handleConnectSelected}
+                        disabled={isConnecting}
+                        className="h-8 bg-[#1d9bf0] hover:bg-[#1a8cd8]"
+                      >
+                        <Plug className="mr-1 h-3 w-3" />
+                        {'批量连接'}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Network Scan Error */}
+                {networkScanError && (
+                  <div className="rounded-lg bg-red-50 dark:bg-red-950/20 p-3">
+                    <p className="text-sm text-red-700 dark:text-red-300">
+                      {networkScanError}
+                    </p>
+                  </div>
+                )}
+
+                {/* Discovered Network Devices */}
+                {!isNetworkScanning &&
+                  discoveredNetworkDevices.length === 0 &&
+                  !networkScanError && (
+                    <p className="text-sm text-slate-500 dark:text-slate-400">
+                      {'点击"重新扫描"开始扫描局域网内的设备'}
+                    </p>
+                  )}
+
+                {discoveredNetworkDevices.length > 0 && (
+                  <div className="space-y-2">
+                    {discoveredNetworkDevices.map(ip => (
+                      <button
+                        key={ip}
+                        onClick={() => toggleIpSelection(ip)}
+                        className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                          selectedIps.has(ip)
+                            ? 'border-[#1d9bf0] bg-blue-50 dark:bg-blue-950/20'
+                            : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={selectedIps.has(ip)}
+                            onChange={() => toggleIpSelection(ip)}
+                            onClick={e => e.stopPropagation()}
+                            className="h-4 w-4 rounded border-slate-300"
+                          />
+                          <Wifi className="h-4 w-4 text-[#1d9bf0]" />
+                          <div className="flex-1">
+                            <p className="font-medium text-sm">{ip}</p>
+                            <p className="text-xs text-slate-500">
+                              {'端口: 5555'}
+                            </p>
+                          </div>
+                          {selectedIps.has(ip) && (
+                            <CheckCircle className="h-4 w-4 text-[#1d9bf0]" />
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </TabsContent>
             </Tabs>
 
             <DialogFooter>
@@ -1385,6 +1565,9 @@ export function DeviceSidebar({
                   setConnectionPort('5555');
                   setActiveTab('direct');
                   setDiscoveredDevices([]);
+                  setDiscoveredNetworkDevices([]);
+                  setNetworkScanError('');
+                  setSelectedIps(new Set());
                 }}
               >
                 {t.common.cancel}

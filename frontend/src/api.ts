@@ -760,6 +760,24 @@ export async function discoverMdnsDevices(): Promise<MdnsDiscoverResponse> {
   return res.data;
 }
 
+export interface NetworkDiscoverResponse {
+  success: boolean;
+  devices: string[];
+  message: string;
+  error?: string;
+}
+
+export async function discoverNetworkDevices(
+  subnet?: string,
+  timeout?: number
+): Promise<NetworkDiscoverResponse> {
+  const res = await axios.post<NetworkDiscoverResponse>(
+    '/api/devices/discover_network',
+    { subnet, timeout }
+  );
+  return res.data;
+}
+
 // QR Code Pairing
 
 export interface QRPairGenerateResponse {

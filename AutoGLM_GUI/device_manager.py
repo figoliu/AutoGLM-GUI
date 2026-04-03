@@ -413,6 +413,21 @@ class DeviceManager:
 
     # Internal methods
 
+    def _emit_device_event(self, event_type: str, device: ManagedDevice) -> None:
+        """Emit device event to frontend via Socket.IO.
+
+        Args:
+            event_type: One of "added", "removed", "state_changed"
+            device: The ManagedDevice that triggered the event
+        """
+        try:
+            from AutoGLM_GUI.socketio_server import emit_device_event
+
+            device_data = device.to_dict()
+            emit_device_event(event_type, device_data)
+        except Exception:
+            pass
+
     def _check_mdns_support(self) -> bool:
         """
         Check if ADB supports mDNS discovery (lazy initialization).
@@ -530,6 +545,9 @@ class DeviceManager:
                 for conn in managed.connections:
                     self._device_id_to_serial[conn.device_id] = serial
 
+                # Notify frontend about new device
+                self._emit_device_event("added", managed)
+
                 logger.info(
                     f"Device added: {serial} ({managed.model or 'Unknown'}) "
                     f"via {managed.connection_type.value} ({managed.primary_device_id})"
@@ -598,6 +616,9 @@ class DeviceManager:
                 for conn in managed.connections:
                     self._device_id_to_serial.pop(conn.device_id, None)
 
+                # Notify frontend about device removal
+                self._emit_device_event("removed", managed)
+
         # Step 5: Discover mDNS devices (if enabled and supported)
         if self._enable_mdns_discovery and self._check_mdns_support():
             from AutoGLM_GUI.adb_plus import (
@@ -649,6 +670,8 @@ class DeviceManager:
                             logger.info(
                                 f"Discovered mDNS device: {mdns_dev.name} at {mdns_dev.ip}:{mdns_dev.port}"
                             )
+                            # Notify frontend about new mDNS device
+                            self._emit_device_event("added", available_device)
                         else:
                             # Update last_seen
                             self._mdns_devices[serial].last_seen = time.time()
@@ -899,6 +922,72 @@ class DeviceManager:
         except Exception as e:
             logger.error(f"Failed to discover remote devices: {e}")
             return (False, f"Discovery failed: {str(e)}", [])
+
+    def discover_network_devices(
+        self, subnet: str | None = None, timeout: float = 0.5
+    ) -> tuple[bool, str, list[str]]:
+        """Scan local subnet for devices with ADB port 5555 open.
+
+        Args:
+            subnet: Subnet to scan in CIDR notation (e.g., "192.168.1.0/24").
+                    If None, auto-detect from local network interface.
+            timeout: Connection timeout per IP in seconds.
+
+        Returns:
+            Tuple of (success, message, discovered_ips)
+        """
+        import ipaddress
+        import socket
+
+        if subnet is None:
+            subnet = self._get_local_subnet()
+            if subnet is None:
+                return (False, "Could not detect local subnet", [])
+
+        logger.info(f"Scanning subnet {subnet} for devices with port 5555 open...")
+
+        discovered_ips: list[str] = []
+        try:
+            network = ipaddress.ip_network(subnet, strict=False)
+        except ValueError as e:
+            return (False, f"Invalid subnet: {e}", [])
+
+        for ip in network.hosts():
+            ip_str = str(ip)
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((ip_str, 5555))
+                sock.close()
+                if result == 0:
+                    logger.debug(f"Found device at {ip_str}:5555")
+                    discovered_ips.append(ip_str)
+            except Exception:
+                pass
+
+        if discovered_ips:
+            msg = f"Found {len(discovered_ips)} device(s): {', '.join(discovered_ips)}"
+            logger.info(msg)
+            return (True, msg, discovered_ips)
+        else:
+            return (False, "No devices found on subnet", [])
+
+    def _get_local_subnet(self) -> str | None:
+        """Get local subnet in CIDR notation from network interfaces."""
+        import socket
+
+        try:
+            hostname = socket.gethostname()
+            addrs = socket.getaddrinfo(hostname, None)
+            for addr in addrs:
+                if addr[0] == socket.AF_INET:
+                    ip = addr[4][0]
+                    if not ip.startswith("127."):
+                        octets = ip.split(".")
+                        return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+        except Exception:
+            pass
+        return None
 
     def add_remote_device(self, base_url: str, device_id: str) -> tuple[bool, str, str]:
         """Manually add a remote HTTP proxy device.

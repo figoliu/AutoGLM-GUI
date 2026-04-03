@@ -27,6 +27,8 @@ from AutoGLM_GUI.schemas import (
     DeviceResponse,
     MdnsDeviceResponse,
     MdnsDiscoverResponse,
+    NetworkDiscoverRequest,
+    NetworkDiscoverResponse,
     QRPairCancelResponse,
     QRPairGenerateResponse,
     QRPairStatusResponse,
@@ -416,6 +418,27 @@ def discover_remote_devices(
     return RemoteDeviceDiscoverResponse(
         success=success,
         devices=devices,
+        message=message,
+        error=None if success else message,
+    )
+
+
+@router.post("/api/devices/discover_network", response_model=NetworkDiscoverResponse)
+def discover_network_devices(
+    request: NetworkDiscoverRequest,
+) -> NetworkDiscoverResponse:
+    """Scan local subnet for devices with ADB port 5555 open."""
+    from AutoGLM_GUI.device_manager import DeviceManager
+
+    device_manager = DeviceManager.get_instance()
+    success, message, devices_list = device_manager.discover_network_devices(
+        subnet=request.subnet,
+        timeout=request.timeout,
+    )
+
+    return NetworkDiscoverResponse(
+        success=success,
+        devices=devices_list,
         message=message,
         error=None if success else message,
     )

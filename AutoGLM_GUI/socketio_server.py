@@ -24,6 +24,26 @@ class VideoPacketPayload(TypedDict):
     pts: NotRequired[int | None]
 
 
+class DeviceEventPayload(TypedDict):
+    event_type: str
+    device: dict[str, Any]
+
+
+DEVICE_EVENT_NAME = "device-event"
+
+
+async def emit_device_event(event_type: str, device_data: dict[str, Any]) -> None:
+    """Emit device event to all connected clients."""
+    payload: DeviceEventPayload = {
+        "event_type": event_type,
+        "device": device_data,
+    }
+    await sio.emit(DEVICE_EVENT_NAME, payload)
+    logger.debug(
+        f"Emitted device event: {event_type} for {device_data.get('serial', 'unknown')}"
+    )
+
+
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins="*",
@@ -301,7 +321,7 @@ async def _process_wait_queue() -> None:
     next_device_id = next_payload.get("device_id") or next_payload.get("deviceId")
 
     if not next_device_id:
-        logger.warning(f"Cannot process queued stream: missing device_id")
+        logger.warning("Cannot process queued stream: missing device_id")
         return
 
     semaphore = _get_semaphore()

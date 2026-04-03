@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import * as React from 'react';
 import { useState, useEffect, useCallback } from 'react';
+import { io, type Socket } from 'socket.io-client';
 import {
   connectWifi,
   disconnectWifi,
@@ -222,6 +223,7 @@ function ChatComponent() {
   const isPageVisible = usePageVisibility();
   const [devices, setDevices] = useState<Device[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<string>('');
+  const socketRef = React.useRef<Socket | null>(null);
   // Chat mode: 'classic' for DevicePanel (single model), 'chatkit' for ChatKitPanel (layered agent)
   // Initialize from URL search params if available
   const [chatMode, setChatMode] = useState<'classic' | 'chatkit'>(
@@ -406,6 +408,41 @@ function ChatComponent() {
       if (timeoutId !== null) {
         window.clearTimeout(timeoutId);
       }
+    };
+  }, [isPageVisible, loadDevices]);
+
+  // Socket.IO connection for device event notifications
+  useEffect(() => {
+    if (!isPageVisible) {
+      return;
+    }
+
+    const socket = io({
+      path: '/socket.io',
+      transports: ['websocket'],
+      timeout: 10000,
+    });
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('[Chat] Socket.IO connected for device events');
+    });
+
+    socket.on(
+      'device-event',
+      (payload: { event_type: string; device: Device }) => {
+        console.log('[Chat] Device event received:', payload);
+        void loadDevices();
+      }
+    );
+
+    socket.on('disconnect', () => {
+      console.log('[Chat] Socket.IO disconnected');
+    });
+
+    return () => {
+      socket.close();
+      socketRef.current = null;
     };
   }, [isPageVisible, loadDevices]);
 
